@@ -1,7 +1,7 @@
 import { LANGS, DECKS, EXERCISES, SCENARIOS } from './data.js';
 import * as S from './store.js';
 import { state, save } from './store.js';
-import { speak, speakQueued, stopSpeaking, canSpeak, canListen, listen, voicesFor, isGoodVoice, onVoicesChanged } from './speech.js';
+import { speak, speakQueued, stopSpeaking, audioMode, canSpeak, canListen, listen, voicesFor, isGoodVoice, onVoicesChanged } from './speech.js';
 import * as AI from './ai.js';
 import * as EL from './elevenlabs.js';
 
@@ -55,6 +55,7 @@ function tutorTalk(text, { slow = false, lang = state.lang } = {}) {
   const rate = state.settings.rate * (slow ? 0.8 : 1);
   const device = (t) => speakQueued(t, LANGS[lang].voice, rate, state.settings.voices[lang]);
   if (!elevenOn(lang)) return device(text);
+  audioMode('speak');
   return tutorVoice.talk(text, { config: { speed: rate }, fallback: device, onError: warnEleven });
 }
 function tutorSay(text, slow = false) {

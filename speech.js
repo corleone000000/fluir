@@ -13,6 +13,17 @@ if ('speechSynthesis' in window) {
 
 export const canSpeak = 'speechSynthesis' in window;
 
+// En iPhone, después de usar el micrófono el sonido sale por el auricular de llamada.
+// Como nunca escuchamos y hablamos a la vez, cambiamos el modo de audio según el turno:
+// 'speak' = altavoz (como un vídeo), 'listen' = el móvil elige el modo para grabar.
+export function audioMode(mode) {
+  const session = navigator.audioSession;
+  if (!session) return;
+  try {
+    session.type = mode === 'speak' ? 'playback' : 'auto';
+  } catch {}
+}
+
 // Avisa cuando el navegador termina de cargar la lista de voces (llega con retraso).
 export function onVoicesChanged(fn) {
   listeners.add(fn);
@@ -58,6 +69,7 @@ function utterance(text, langCode, rate, voiceURI) {
 
 export function speak(text, langCode, rate = 1, voiceURI = '') {
   if (!canSpeak || !text) return;
+  audioMode('speak');
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance(text, langCode, rate, voiceURI));
 }
@@ -70,6 +82,7 @@ const queued = new Set();
 export function speakQueued(text, langCode, rate = 1, voiceURI = '') {
   return new Promise((resolve) => {
     if (!canSpeak || !text.trim()) return resolve();
+    audioMode('speak');
     const u = utterance(text, langCode, rate, voiceURI);
     queued.add(u);
     const done = () => {
@@ -93,6 +106,7 @@ export const canListen = Boolean(Recognition);
 // Devuelve { stop, abort }: stop termina y conserva lo dicho, abort lo descarta.
 export function listen(langCode, { onText, onEnd, onError }) {
   if (!canListen) return null;
+  audioMode('listen');
   const rec = new Recognition();
   rec.lang = langCode;
   rec.interimResults = true;
