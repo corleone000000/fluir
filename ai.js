@@ -60,7 +60,13 @@ export function friendlyError(err) {
 }
 
 function textOf(message) {
-  return message.content
+  return messageText(message.content);
+}
+
+// Texto visible de un mensaje guardado (puede ser texto o una lista de bloques).
+export function messageText(content) {
+  if (typeof content === 'string') return content;
+  return content
     .filter((b) => b.type === 'text')
     .map((b) => b.text)
     .join('');
@@ -84,7 +90,9 @@ How to reply:
 - After your reply, if the student's last message had mistakes or sounded unnatural, add a line containing only ${FIX_MARK} and then up to 3 short corrections, one per line, in this format:
 ❌ what they wrote → ✅ better version — very short reason in ${explain}
 - If their message was correct and natural, leave out the ${FIX_MARK} section entirely. Small typos and missing accents or capital letters are fine, don't correct them.
-- Plain text only: no markdown, no lists, no headings.${voice ? `
+- Plain text only: no markdown, no lists, no headings.
+- Your replies are read aloud by the app's voice. If the student asks you to speak more slowly, faster or at normal speed (in any language), use the ${SPEED_TOOL.name} tool straight away; it is the only way to change how fast you sound, so never just promise it. After the tool result, confirm in one short sentence in ${target} and carry on with the conversation.
+- When you use a tool, you may say a brief sentence first. Do not include internal or system XML tags in your response.${voice ? `
 
 This is a live voice call. The student's messages are automatic speech transcriptions, and your reply will be read aloud by a text-to-speech voice:
 - Talk like a real person on the phone: one or two short sentences per turn, with contractions and natural spoken phrasing.
@@ -95,25 +103,158 @@ This is a live voice call. The student's messages are automatic speech transcrip
 export const KICKOFF = '[The student just opened this conversation. Greet them briefly and start the scenario with an opening line or question.]';
 export const CALL_KICKOFF = '[The student just started a voice call with you. Pick the conversation up naturally from where it was, with a short line or question.]';
 
-// messages: [{role, content}] ; onText(textoAcumulado) se llama mientras llega la respuesta.
-// voice: true en modo llamada (respuestas más cortas y habladas).
-export async function tutorReply(lang, scenario, messages, onText, { voice = false } = {}) {
-  const stream = client().beta.messages.stream({
+// Herramienta para que el tutor cambie de verdad la velocidad de su voz cuando se lo piden.
+export const SPEED_CHANGES = ['much_slower', 'slower', 'normal', 'faster', 'much_faster'];
+const SPEED_TOOL = {
+  name: 'set_speech_speed',
+  description:
+    'Changes how fast the app reads your replies aloud. Use it whenever the student asks you to talk more slowly, faster or at normal speed, in any language (for example "can you speak more slowly?", "habla más despacio", "a bit faster, please").',
+  input_schema: {
+    type: 'object',
+    properties: {
+      change: {
+        type: 'string',
+        enum: SPEED_CHANGES,
+        description:
+          '"slower" or "faster" for a normal request; "much_slower" or "much_faster" if they ask for a big change or say it is still too fast or too slow; "normal" to go back to the default speed.',
+      },
+    },
+    required: ['change'],
+    additionalProperties: false,
+  },
+  strict: true,
+};
+
+// Tiempos máximos: si la respuesta no empieza o se queda parada, se corta y se reintenta.
+const FIRST_TOKEN_MS = 15000;
+const STALL_MS = 12000;
+const MAX_TOOL_ROUNDS = 3;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Si la API rechazara alguno de los ajustes opcionales, se reintenta sin ellos el resto de la sesión.
+let lean = false;
+
+function tutorParams(system, messages) {
+  const params = {
     ...baseParams(),
     max_tokens: 16000,
-    system: tutorSystem(lang, scenario, voice),
-    messages: messages.map(({ role, content }) => ({ role, content })),
-  });
-  let acc = '';
-  stream.on('text', (delta) => {
-    acc += delta;
-    onText(acc);
-  });
-  const final = await stream.finalMessage();
-  if (final.stop_reason === 'refusal') {
-    throw new Error('El tutor no ha podido responder a eso. Prueba a decirlo de otra forma.');
+    system,
+    messages,
+    tools: [lean ? { ...SPEED_TOOL, strict: undefined } : SPEED_TOOL],
+  };
+  if (!lean) {
+    // Reutiliza el principio de la conversación ya procesado: respuestas más rápidas en charlas largas.
+    params.cache_control = { type: 'ephemeral' };
+    // En Haiku, sin pensamiento previo: para conversar en voz alta importa más la rapidez.
+    if (params.model === 'claude-haiku-5-5') params.thinking = { type: 'disabled' };
   }
-  return textOf(final);
+  return params;
+}
+
+// El historial se envía sin los bloques de pensamiento de turnos anteriores: no hacen falta
+// para seguir la charla y así el historial sigue siendo válido aunque cambie el modo (texto o llamada).
+function withoutThinking(content) {
+  if (typeof content === 'string') return content;
+  return content.filter(
+    (b) => b.type !== 'thinking' && b.type !== 'redacted_thinking' && !(b.type === 'text' && !b.text.trim()),
+  );
+}
+
+function historyForApi(messages) {
+  const out = [];
+  for (const { role, content } of messages) {
+    if (role !== 'user' && role !== 'assistant') continue;
+    const clean = withoutThinking(content);
+    if (typeof clean === 'string' ? clean.trim() : clean.length) out.push({ role, content: clean });
+  }
+  return out;
+}
+
+async function streamRound(params, { signal, onDelta }) {
+  const stream = client().beta.messages.stream(params, { signal });
+  let timer = null;
+  const arm = (ms) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => stream.abort(), ms);
+  };
+  arm(FIRST_TOKEN_MS);
+  stream.on('streamEvent', () => arm(STALL_MS));
+  stream.on('text', onDelta);
+  try {
+    return await stream.finalMessage();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Un turno del tutor: puede tener varias rondas si usa la herramienta de velocidad.
+// onText(texto) recibe todo lo que va diciendo; onSpeed(cambio) aplica la velocidad y devuelve
+// un texto para el tutor; commit(mensaje) guarda cada mensaje nuevo en orden, en cuanto está completo.
+// Devuelve { text } con todo lo que ha dicho en este turno.
+export async function tutorTurn({ lang, scenario, messages, voice = false, signal, onText, onSpeed, commit }) {
+  const system = tutorSystem(lang, scenario, voice);
+  const history = historyForApi(messages);
+  const turn = []; // mensajes de este turno tal cual los devuelve la API (se reenvían sin tocar)
+  let said = '';
+
+  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+    const prefix = said ? `${said} ` : '';
+    let segment = '';
+    let final = null;
+    for (let attempt = 0; !final; attempt++) {
+      segment = '';
+      try {
+        final = await streamRound(tutorParams(system, history.concat(turn)), {
+          signal,
+          onDelta: (delta) => {
+            segment += delta;
+            onText?.(prefix + segment);
+          },
+        });
+      } catch (err) {
+        if (signal?.aborted) throw new Error('ABORTED');
+        if (segment.trim()) {
+          // Se cortó a mitad de respuesta: nos quedamos con lo que ya ha dicho.
+          final = { content: [{ type: 'text', text: segment }], stop_reason: 'end_turn' };
+          break;
+        }
+        if (err instanceof Anthropic.BadRequestError && !lean) {
+          lean = true;
+          console.warn('Reintentando sin ajustes opcionales:', err.message);
+          continue;
+        }
+        const status = err?.status;
+        const retryable = !(err instanceof Anthropic.APIError) || status === undefined || status === 429 || status >= 500;
+        if (!retryable || attempt >= 1) throw err;
+        await sleep(800);
+      }
+    }
+
+    if (final.stop_reason === 'refusal') {
+      throw new Error('El tutor no ha podido responder a eso. Prueba a decirlo de otra forma.');
+    }
+    const text = textOf(final);
+    if (text.trim()) said = prefix + text;
+    if (!final.content.length) break;
+    turn.push({ role: 'assistant', content: final.content });
+    const visible = withoutThinking(final.content);
+    if (visible.length) commit?.({ role: 'assistant', content: visible });
+
+    const toolUses = final.content.filter((b) => b.type === 'tool_use');
+    if (!toolUses.length) break;
+    // Cada llamada a la herramienta necesita su respuesta, aunque no se haya podido ejecutar.
+    const results = toolUses.map((b) => {
+      const valid = final.stop_reason === 'tool_use' && b.name === SPEED_TOOL.name && SPEED_CHANGES.includes(b.input?.change);
+      return valid
+        ? { type: 'tool_result', tool_use_id: b.id, content: onSpeed?.(b.input.change) || 'Done.' }
+        : { type: 'tool_result', tool_use_id: b.id, content: 'Could not change the speed (invalid request).', is_error: true };
+    });
+    const toolMessage = { role: 'user', content: results };
+    turn.push(toolMessage);
+    commit?.({ ...toolMessage, hidden: true });
+    if (final.stop_reason !== 'tool_use') break;
+  }
+  return { text: said };
 }
 
 export function splitReply(text) {

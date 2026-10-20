@@ -16,12 +16,25 @@ export const canSpeak = 'speechSynthesis' in window;
 // En iPhone, después de usar el micrófono el sonido sale por el auricular de llamada.
 // Como nunca escuchamos y hablamos a la vez, cambiamos el modo de audio según el turno:
 // 'speak' = altavoz (como un vídeo), 'listen' = el móvil elige el modo para grabar.
+// Solo se cambia si hace falta: reconfigurar el audio mientras algo suena puede cortarlo.
 export function audioMode(mode) {
   const session = navigator.audioSession;
   if (!session) return;
+  const type = mode === 'speak' ? 'playback' : 'auto';
+  if (session.type === type) return;
   try {
-    session.type = mode === 'speak' ? 'playback' : 'auto';
+    session.type = type;
   } catch {}
+}
+
+// iPhone solo deja hablar al navegador si la primera vez ocurre dentro de un toque en la pantalla.
+let speechUnlocked = false;
+export function unlockSpeech() {
+  if (!canSpeak || speechUnlocked) return;
+  speechUnlocked = true;
+  const u = new SpeechSynthesisUtterance(' ');
+  u.volume = 0;
+  window.speechSynthesis.speak(u);
 }
 
 // Avisa cuando el navegador termina de cargar la lista de voces (llega con retraso).
@@ -69,34 +82,58 @@ function utterance(text, langCode, rate, voiceURI) {
 
 export function speak(text, langCode, rate = 1, voiceURI = '') {
   if (!canSpeak || !text) return;
+  stopSpeaking();
   audioMode('speak');
-  window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utterance(text, langCode, rate, voiceURI));
 }
 
-// Chrome a veces descarta las frases en cola antes de leerlas si nadie las referencia.
-const queued = new Set();
+// Cola propia, una frase cada vez: la cola del navegador a veces se salta frases o se atasca.
+let queueTail = Promise.resolve();
+let generation = 0;
+const finishers = new Set(); // cómo dar por terminada cada frase pendiente
+const keepAlive = new Set(); // Chrome descarta frases sin referencia antes de leerlas
 
-// Añade una frase a la cola sin cortar la anterior. La promesa se resuelve al terminar de leerla
-// (o si se cancela con stopSpeaking).
+// Añade una frase a la cola sin cortar la anterior. La promesa siempre se cumple: al terminar de
+// leerla, si se corta con stopSpeaking o, como muy tarde, al pasar el tiempo que debería durar.
 export function speakQueued(text, langCode, rate = 1, voiceURI = '') {
+  const gen = generation;
+  const job = queueTail.then(() => (gen === generation ? speakOne(text, langCode, rate, voiceURI) : undefined));
+  queueTail = job;
+  return job;
+}
+
+function speakOne(text, langCode, rate, voiceURI) {
   return new Promise((resolve) => {
     if (!canSpeak || !text.trim()) return resolve();
-    audioMode('speak');
+    const synth = window.speechSynthesis;
     const u = utterance(text, langCode, rate, voiceURI);
-    queued.add(u);
+    let timer = null;
     const done = () => {
-      queued.delete(u);
+      if (!finishers.delete(done)) return;
+      keepAlive.delete(u);
+      clearTimeout(timer);
       resolve();
     };
+    finishers.add(done);
+    keepAlive.add(u);
     u.onend = done;
     u.onerror = done;
-    window.speechSynthesis.speak(u);
+    // Unos 10 caracteres por segundo a velocidad normal, con margen de sobra.
+    timer = setTimeout(() => {
+      synth.cancel();
+      done();
+    }, (text.length / (10 * rate)) * 1000 + 5000);
+    audioMode('speak');
+    if (synth.paused) synth.resume();
+    synth.speak(u);
   });
 }
 
 export function stopSpeaking() {
+  generation++;
+  queueTail = Promise.resolve();
   if (canSpeak) window.speechSynthesis.cancel();
+  [...finishers].forEach((done) => done());
 }
 
 const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;

@@ -68,7 +68,7 @@ export async function getUsage(key) {
   return { used: data.character_count, limit: data.character_limit, resetsAt: data.next_character_count_reset_unix };
 }
 
-async function synthesize(text, { key, voiceId, model, lang, speed, previousText, signal }) {
+export async function synthesize(text, { key, voiceId, model, lang, speed, previousText, signal }) {
   const res = await request(`/v1/text-to-speech/${encodeURIComponent(voiceId)}/stream?output_format=mp3_44100_128`, key, {
     method: 'POST',
     signal,
@@ -84,7 +84,7 @@ async function synthesize(text, { key, voiceId, model, lang, speed, previousText
 }
 
 // Una décima de segundo de silencio en WAV, para "desbloquear" el audio en el móvil.
-function silentWav() {
+export function silentWav() {
   const samples = 800;
   const rate = 8000;
   const v = new DataView(new ArrayBuffer(44 + samples));
@@ -104,75 +104,4 @@ function silentWav() {
   v.setUint32(40, samples, true);
   for (let i = 0; i < samples; i++) v.setUint8(44 + i, 128);
   return URL.createObjectURL(new Blob([v.buffer], { type: 'audio/wav' }));
-}
-
-// Reproductor en cola: cada frase se pide a ElevenLabs en cuanto llega (en paralelo)
-// y se reproduce en orden. Un único <audio> para que el móvil no bloquee la reproducción.
-export function createTutorVoice(getConfig) {
-  const audio = new Audio();
-  audio.preload = 'auto';
-  let chain = Promise.resolve();
-  let generation = 0;
-  let controllers = new Set();
-  let lastText = '';
-
-  // Hay que llamarlo dentro de un toque del usuario (iPhone solo deja sonar audio así).
-  function unlock() {
-    if (audio.dataset.unlocked) return;
-    audio.src = silentWav();
-    audio.play().then(() => (audio.dataset.unlocked = '1')).catch(() => {});
-  }
-
-  function playBlob(blob, gen) {
-    return new Promise((resolve) => {
-      if (gen !== generation) return resolve();
-      const url = URL.createObjectURL(blob);
-      const done = () => {
-        audio.onended = audio.onerror = audio.onpause = null;
-        URL.revokeObjectURL(url);
-        resolve();
-      };
-      audio.onended = done;
-      audio.onerror = done;
-      audio.onpause = () => {
-        if (gen !== generation) done();
-      };
-      audio.src = url;
-      audio.play().catch(done);
-    });
-  }
-
-  // fallback(text) se usa si ElevenLabs falla: debe devolver una promesa que acabe al terminar de hablar.
-  // config: datos que cambian por llamada (por ejemplo, la velocidad).
-  function talk(text, { fallback, onError, config } = {}) {
-    const gen = generation;
-    const cfg = { ...getConfig(), ...config };
-    const ctrl = new AbortController();
-    controllers.add(ctrl);
-    const blobPromise = synthesize(text, { ...cfg, previousText: lastText, signal: ctrl.signal })
-      .finally(() => controllers.delete(ctrl));
-    lastText = text;
-    chain = chain.then(async () => {
-      if (gen !== generation) return;
-      try {
-        await playBlob(await blobPromise, gen);
-      } catch (err) {
-        if (gen !== generation || err.name === 'AbortError') return;
-        onError?.(err);
-        await fallback?.(text);
-      }
-    });
-    return chain;
-  }
-
-  function stop() {
-    generation++;
-    controllers.forEach((c) => c.abort());
-    controllers.clear();
-    lastText = '';
-    audio.pause();
-    chain = Promise.resolve();
-  }
-
-  return { talk, stop, unlock };
 }

@@ -1,9 +1,10 @@
 import { LANGS, DECKS, EXERCISES, SCENARIOS } from './data.js';
 import * as S from './store.js';
 import { state, save } from './store.js';
-import { speak, speakQueued, stopSpeaking, audioMode, canSpeak, canListen, listen, voicesFor, isGoodVoice, onVoicesChanged } from './speech.js';
+import { speak, canSpeak, canListen, listen, voicesFor, isGoodVoice, onVoicesChanged } from './speech.js';
 import * as AI from './ai.js';
 import * as EL from './elevenlabs.js';
+import { createSpeaker, sentences } from './voice.js';
 
 const $screen = document.getElementById('screen');
 const $title = document.getElementById('screen-title');
@@ -33,35 +34,55 @@ const say = (text, slow = false, lang = state.lang) =>
   speak(text, LANGS[lang].voice, state.settings.rate * (slow ? 0.7 : 1), state.settings.voices[lang]);
 
 // Voz del tutor: ElevenLabs si está activada; si no (o si falla), la voz gratis del móvil.
-const tutorVoice = EL.createTutorVoice(() => {
-  const e = state.settings.eleven;
-  return { key: e.key, model: e.model, voiceId: e.voices[state.lang], lang: state.lang, speed: state.settings.rate };
-});
-const elevenOn = (lang = state.lang) => {
-  const e = state.settings.eleven;
-  return Boolean(e.enabled && e.key && e.voices[lang]);
-};
 let elevenWarned = false;
-const warnEleven = (err) => {
-  if (elevenWarned) return;
-  elevenWarned = true;
-  toast(`${err.message} Sigo con la voz del móvil.`);
-};
-function stopAllVoices() {
-  stopSpeaking();
-  tutorVoice.stop();
-}
-function tutorTalk(text, { slow = false, lang = state.lang } = {}) {
-  const rate = state.settings.rate * (slow ? 0.8 : 1);
-  const device = (t) => speakQueued(t, LANGS[lang].voice, rate, state.settings.voices[lang]);
-  if (!elevenOn(lang)) return device(text);
-  audioMode('speak');
-  return tutorVoice.talk(text, { config: { speed: rate }, fallback: device, onError: warnEleven });
-}
+const speaker = createSpeaker({
+  getConfig: (lang) => {
+    const s = state.settings;
+    const e = s.eleven;
+    return {
+      rate: s.rate,
+      deviceLang: LANGS[lang].voice,
+      voiceURI: s.voices[lang],
+      eleven: e.enabled && e.key && e.voices[lang] ? { key: e.key, model: e.model, voiceId: e.voices[lang] } : null,
+    };
+  },
+  onElevenError: (err) => {
+    if (elevenWarned) return;
+    elevenWarned = true;
+    toast(`${err.message} Sigo con la voz del móvil.`);
+  },
+});
+const stopAllVoices = () => speaker.stop();
+
+// Lee en voz alta una respuesta ya completa del tutor.
 function tutorSay(text, slow = false) {
-  stopAllVoices();
-  tutorVoice.unlock();
-  tutorTalk(text, { slow });
+  speaker.unlock();
+  const talk = speaker.begin(state.lang, { rateFactor: slow ? 0.8 : 1 });
+  sentences(text).forEach((s) => talk.push(s));
+  return talk.finish();
+}
+
+// El tutor llama a esto cuando ella pide que hable más despacio o más rápido.
+// Cambia la velocidad guardada (la misma que el control de Ajustes) y devuelve qué ha pasado.
+const SPEED_FACTORS = { much_slower: 0.75, slower: 0.87, faster: 1.15, much_faster: 1.3 };
+const MIN_RATE = 0.6;
+const MAX_RATE = 1.4;
+function applySpeed(change) {
+  const s = state.settings;
+  const before = s.rate;
+  const target = change === 'normal' ? 1 : before * SPEED_FACTORS[change];
+  const next = Math.round(Math.min(MAX_RATE, Math.max(MIN_RATE, target)) * 100) / 100;
+  s.rate = next;
+  save();
+  const fmt = (n) => `${n.toFixed(2).replace('.', ',')}×`;
+  if (next === before) {
+    toast(change === 'normal' ? 'La voz ya va a velocidad normal' : `La voz ya está al ${next <= MIN_RATE ? 'mínimo' : 'máximo'} (${fmt(next)})`);
+    return change === 'normal'
+      ? `The speed was already normal (${next}×).`
+      : `The speed is already at the ${next <= MIN_RATE ? 'slowest' : 'fastest'} setting (${next}×), so it could not change. Tell the student briefly.`;
+  }
+  toast(`${next < before ? '🐢 Más despacio' : '🐇 Más rápido'}: ${fmt(next)}`);
+  return `Done. Your voice now speaks at ${next}× (it was ${before}×; 1× is the normal speed).`;
 }
 
 let toastTimer;
@@ -245,36 +266,58 @@ function renderChat(chat) {
     $chat.innerHTML = '';
     for (const m of chat.messages) {
       if (m.hidden) continue;
-      if (m.role === 'user') $chat.insertAdjacentHTML('beforeend', `<div class="msg user">${esc(m.content)}</div>`);
-      else bubbleAI(m.content);
+      if (m.role === 'user') {
+        if (typeof m.content === 'string') $chat.insertAdjacentHTML('beforeend', `<div class="msg user">${esc(m.content)}</div>`);
+        continue;
+      }
+      const text = AI.messageText(m.content);
+      if (text.trim()) bubbleAI(text);
     }
     scrollDown();
   }
   const scrollDown = () => window.scrollTo(0, document.body.scrollHeight);
 
+  // Responde a lo último que ha dicho ella. Si falla, su mensaje se queda y se puede reintentar.
   async function askTutor() {
     busy = true;
     $send.disabled = true;
+    $chat.querySelectorAll('.msg.err').forEach((el) => el.remove());
     const live = document.createElement('div');
     live.className = 'msg ai';
     live.innerHTML = '<span class="spinner"></span>';
     $chat.appendChild(live);
     scrollDown();
     try {
-      const text = await AI.tutorReply(lang, scenario, chat.messages, (acc) => {
-        live.textContent = AI.splitReply(acc).reply;
-        scrollDown();
+      const { text } = await AI.tutorTurn({
+        lang,
+        scenario,
+        messages: chat.messages,
+        onText: (acc) => {
+          live.textContent = AI.splitReply(acc).reply;
+          scrollDown();
+        },
+        onSpeed: applySpeed,
+        commit: (msg) => {
+          chat.messages.push(msg);
+          save();
+        },
       });
       live.remove();
-      chat.messages.push({ role: 'assistant', content: text });
-      save();
-      bubbleAI(text);
+      if (text.trim()) {
+        bubbleAI(text);
+        if (state.settings.autoSpeak) tutorSay(AI.splitReply(text).reply);
+      }
       scrollDown();
-      if (state.settings.autoSpeak) tutorSay(AI.splitReply(text).reply);
       return true;
     } catch (err) {
       live.remove();
-      $chat.insertAdjacentHTML('beforeend', `<div class="msg err">${esc(AI.friendlyError(err))}</div>`);
+      const el = document.createElement('div');
+      el.className = 'msg err';
+      el.innerHTML = `${esc(AI.friendlyError(err))}<div class="tools"><button>🔄 Reintentar</button></div>`;
+      el.querySelector('button').addEventListener('click', () => {
+        if (!busy) askTutor();
+      });
+      $chat.appendChild(el);
       scrollDown();
       return false;
     } finally {
@@ -288,21 +331,14 @@ function renderChat(chat) {
     if (!text || busy) return;
     rec?.stop();
     stopAllVoices();
-    tutorVoice.unlock();
+    speaker.unlock();
     $msg.value = '';
     chat.messages.push({ role: 'user', content: text });
     save();
     $chat.insertAdjacentHTML('beforeend', `<div class="msg user">${esc(text)}</div>`);
-    const ok = await askTutor();
-    if (ok) {
+    if (await askTutor()) {
       state.stats.tutorMessages += 1;
       gainXP(5);
-    } else {
-      // Si falla, devolvemos el mensaje al cuadro de texto para reenviarlo.
-      chat.messages.pop();
-      save();
-      $msg.value = text;
-      $chat.querySelectorAll('.msg.user')[$chat.querySelectorAll('.msg.user').length - 1]?.remove();
     }
   }
 
@@ -359,14 +395,15 @@ function renderChat(chat) {
     if (busy) return toast('Espera a que el tutor termine de responder.');
     rec?.stop();
     stopAllVoices();
-    tutorVoice.unlock();
+    speaker.unlock();
     openCall({ chat, scenario, lang, onClose: () => go('tutor') });
   });
 
   cleanup = () => rec?.stop();
   drawAll();
+  // Si lo último es de ella (o falta la respuesta tras cambiar la velocidad), el tutor contesta.
   const last = chat.messages[chat.messages.length - 1];
-  if (last.role === 'user') askTutor();
+  if (last?.role === 'user') askTutor();
 }
 
 // ---------- Modo llamada ----------
@@ -396,134 +433,184 @@ function openCall({ chat, scenario, lang, onClose }) {
   document.body.appendChild(overlay);
 
   const $ = (id) => overlay.querySelector(`#${id}`);
+  // Tiempos de escucha: 2 s de silencio tras hablar = ha terminado; nada en 8 s = se vuelve a intentar.
+  const PAUSE_MS = 2000;
+  const NO_SPEECH_MS = 8000;
+  const MAX_SILENT_TRIES = 4;
+  const AFTER_SPEECH_MS = 300; // para que el micro no oiga el final de la voz del tutor
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Cada fase nueva (pensar, hablar, escuchar, pausa) sube `step`, y lo que llegue tarde de una
+  // fase anterior se ignora: así nunca hay dos cosas a la vez ni estados colgados.
+  let step = 0;
   let closed = false;
   let rec = null;
+  let listenTimer = null;
   let silentTries = 0;
   let micDenied = false;
+  let userStopped = false;
   let slow = false;
-  let interrupted = false;
+  let talk = null;
+  let request = null; // respuesta en curso: { abort, done }
   let wakeLock = null;
 
   const started = Date.now();
-  const timer = setInterval(() => {
+  const clock = setInterval(() => {
     const s = Math.floor((Date.now() - started) / 1000);
     $('call-time').textContent = `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
   }, 1000);
-  navigator.wakeLock?.request('screen').then((w) => (wakeLock = w)).catch(() => {});
+  const keepAwake = () => navigator.wakeLock?.request('screen').then((w) => (wakeLock = w)).catch(() => {});
+  keepAwake();
 
   const setPhase = (phase, text) => {
     overlay.dataset.phase = phase;
     $('call-status').textContent = text;
   };
-  const talk = (text) => tutorTalk(text, { slow, lang });
+  // ¿Queda algo de ella sin responder?
+  const unanswered = () => chat.messages[chat.messages.length - 1]?.role === 'user';
+
+  function stopListening() {
+    clearTimeout(listenTimer);
+    const r = rec;
+    rec = null;
+    try {
+      r?.abort();
+    } catch {}
+  }
 
   async function tutorTurn() {
+    const my = ++step;
+    stopListening();
     setPhase('thinking', 'Pensando…');
-    interrupted = false;
+    if (request) await request.done; // que la respuesta anterior termine de guardarse
+    if (my !== step || closed) return false;
     $('call-fix').hidden = true;
     $('call-caption').textContent = '';
-    let spoken = 0;
-    const pending = [];
-    // Lee en voz alta cada frase completa en cuanto llega, sin esperar al final de la respuesta.
-    const flush = (reply, final) => {
-      let chunk = reply.slice(spoken);
-      if (!final) {
-        const m = chunk.match(/^[\s\S]*?[.!?…]+(?=\s)/);
-        if (!m) return;
-        chunk = m[0];
-      }
-      spoken += chunk.length;
-      if (!chunk.trim() || interrupted) return;
-      if (overlay.dataset.phase === 'thinking') setPhase('speaking', 'Hablando… (toca para interrumpir)');
-      pending.push(talk(chunk.trim()));
-    };
+    talk = speaker.begin(lang, { rateFactor: slow ? 0.8 : 1 });
+
+    let fed = 0;
     const replyPart = (acc) => {
       const cut = acc.indexOf(AI.FIX_MARK);
       return cut === -1 ? acc.replace(/%$/, '') : acc.slice(0, cut);
     };
-    try {
-      const text = await AI.tutorReply(lang, scenario, chat.messages, (acc) => {
-        if (closed) return;
+    // Pasa a la voz cada frase completa en cuanto llega, sin esperar al final de la respuesta.
+    const feed = (reply, final) => {
+      if (my !== step) return;
+      for (;;) {
+        let chunk = reply.slice(fed);
+        if (!final) {
+          const m = chunk.match(/^[\s\S]*?[.!?…]+(?=\s)/);
+          if (!m) return;
+          chunk = m[0];
+        }
+        fed += chunk.length;
+        if (chunk.trim()) {
+          if (overlay.dataset.phase === 'thinking') setPhase('speaking', 'Hablando… (toca para interrumpir)');
+          talk.push(chunk);
+        }
+        if (final) return;
+      }
+    };
+
+    const abort = new AbortController();
+    const done = AI.tutorTurn({
+      lang,
+      scenario,
+      messages: chat.messages,
+      voice: true,
+      signal: abort.signal,
+      onText: (acc) => {
+        if (my !== step) return;
         const reply = replyPart(acc);
         $('call-caption').textContent = reply.trim();
-        for (let before = -1; before !== spoken; ) {
-          before = spoken;
-          flush(reply, false);
-        }
-      }, { voice: true });
-      if (closed) return false;
-      chat.messages.push({ role: 'assistant', content: text });
-      save();
-      flush(replyPart(text), true);
+        feed(reply, false);
+      },
+      onSpeed: (change) => {
+        const result = applySpeed(change);
+        // Lo que diga a partir de aquí ya sale con la velocidad nueva.
+        if (my === step) talk = speaker.begin(lang, { rateFactor: slow ? 0.8 : 1 });
+        return result;
+      },
+      commit: (msg) => {
+        chat.messages.push(msg);
+        save();
+      },
+    });
+    request = { abort, done: done.then(() => {}, () => {}) };
+    try {
+      const { text } = await done;
+      if (my !== step || closed) return true;
+      feed(replyPart(text), true);
       const { reply, fixes } = AI.splitReply(text);
       $('call-caption').textContent = reply;
-      if (fixes) {
-        $('call-fix').textContent = `✏️ ${fixes}`;
-        $('call-fix').hidden = false;
-      }
-      if (overlay.dataset.phase === 'thinking') setPhase('speaking', 'Hablando… (toca para interrumpir)');
-      await Promise.all(pending);
-      if (!closed) startListening();
+      $('call-fix').textContent = fixes ? `✏️ ${fixes}` : '';
+      $('call-fix').hidden = !fixes;
+      await talk.finish();
+      if (my !== step || closed) return true;
+      await sleep(AFTER_SPEECH_MS);
+      if (my === step && !closed) startListening();
       return true;
     } catch (err) {
-      if (!closed) setPhase('idle', AI.friendlyError(err));
+      if (closed || my !== step || err?.message === 'ABORTED') return false;
+      speaker.stop();
+      setPhase('idle', `${AI.friendlyError(err)} Toca el círculo para reintentar.`);
       return false;
+    } finally {
+      if (request?.abort === abort) request = null;
     }
   }
 
   async function userTurn(text) {
+    setPhase('thinking', 'Pensando…');
+    if (request) await request.done; // su frase va detrás de la respuesta anterior
+    if (closed) return;
     chat.messages.push({ role: 'user', content: text });
     save();
-    const ok = await tutorTurn();
-    if (ok) {
+    if (await tutorTurn()) {
       state.stats.tutorMessages += 1;
       gainXP(5);
-    } else if (!closed) {
-      // No se pudo responder: quitamos su frase para que pueda repetirla.
-      chat.messages.pop();
-      save();
     }
   }
 
-  // Tiempos del turno de escucha: silencio tras hablar = ha terminado; nada al empezar = no hay nadie.
-  const PAUSE_MS = 2000;
-  const NO_SPEECH_MS = 8000;
-  let userStopped = false;
-  let listenTimer = null;
-
   function startListening() {
-    if (closed || rec) return;
-    stopAllVoices();
+    if (closed) return;
+    const my = ++step;
+    stopListening();
+    speaker.stop();
     let heard = '';
     userStopped = false;
     setPhase('listening', 'Te escucho… (toca el círculo para pausar)');
     $('call-you').textContent = '';
-    const restartTimer = (ms) => {
+    const arm = (ms) => {
       clearTimeout(listenTimer);
-      listenTimer = setTimeout(() => rec?.stop(), ms);
+      listenTimer = setTimeout(() => {
+        if (my === step) rec?.stop();
+      }, ms);
     };
     rec = listen(L.voice, {
       onText: (t) => {
+        if (my !== step) return;
         heard = t;
         $('call-you').textContent = `«${t}»`;
         // Algunos móviles no cortan solos al quedarse en silencio: lo hacemos nosotros.
-        restartTimer(PAUSE_MS);
+        arm(PAUSE_MS);
       },
       onError: (code) => {
         if (code === 'not-allowed' || code === 'service-not-allowed') micDenied = true;
       },
       onEnd: () => {
+        if (my !== step || closed) return;
         clearTimeout(listenTimer);
         rec = null;
-        if (closed) return;
-        if (heard.trim()) {
+        const said = heard.trim();
+        if (said) {
           silentTries = 0;
-          userTurn(heard.trim());
+          userTurn(said);
         } else if (micDenied) {
-          setPhase('idle', 'Permite el micrófono en el navegador para poder hablar.');
+          setPhase('idle', 'Permite el micrófono en el navegador y toca el círculo para hablar.');
         } else if (userStopped) {
           setPhase('idle', 'En pausa. Toca el círculo cuando quieras hablar.');
-        } else if (++silentTries < 3) {
+        } else if (++silentTries < MAX_SILENT_TRIES) {
           startListening();
         } else {
           const ios = navigator.standalone === true;
@@ -531,23 +618,26 @@ function openCall({ chat, scenario, lang, onClose }) {
         }
       },
     });
-    if (!rec) setPhase('idle', 'Este navegador no permite usar el micrófono.');
-    else restartTimer(NO_SPEECH_MS);
+    if (!rec) return setPhase('idle', 'Este navegador no permite usar el micrófono.');
+    arm(NO_SPEECH_MS);
   }
 
   $('orb').addEventListener('click', () => {
+    speaker.unlock();
     const phase = overlay.dataset.phase;
     if (phase === 'speaking') {
-      // Corta al tutor; en cuanto termina su turno se pone a escuchar solo.
-      interrupted = true;
-      stopAllVoices();
+      // Corta al tutor y le toca a ella.
+      startListening();
     } else if (phase === 'listening') {
       // Si ya ha dicho algo, lo envía; si no, deja la llamada en pausa.
       userStopped = true;
-      rec?.stop();
+      if (rec) rec.stop();
+      else startListening();
     } else if (phase === 'idle') {
       silentTries = 0;
-      startListening();
+      micDenied = false;
+      if (unanswered()) tutorTurn();
+      else startListening();
     }
   });
 
@@ -563,26 +653,39 @@ function openCall({ chat, scenario, lang, onClose }) {
     toast(slow ? 'El tutor hablará más despacio' : 'Velocidad normal');
   });
 
+  // Si sale de la app (o se bloquea el móvil), la llamada se pone en pausa y no se queda a medias.
+  const onVisibility = () => {
+    if (closed) return;
+    if (document.visibilityState === 'hidden') {
+      step++;
+      request?.abort.abort();
+      stopListening();
+      speaker.stop();
+      setPhase('idle', 'En pausa. Toca el círculo para seguir.');
+    } else {
+      keepAwake();
+    }
+  };
+  document.addEventListener('visibilitychange', onVisibility);
+
   // Colgar siempre cierra la pantalla, aunque el micrófono o el audio den problemas.
   $('btn-hang').addEventListener('click', () => {
     if (closed) return;
     closed = true;
+    step++;
     overlay.remove();
-    clearInterval(timer);
-    clearTimeout(listenTimer);
-    for (const step of [() => rec?.abort(), stopAllVoices, () => wakeLock?.release().catch(() => {})]) {
+    clearInterval(clock);
+    document.removeEventListener('visibilitychange', onVisibility);
+    for (const fn of [() => request?.abort.abort(), stopListening, () => speaker.stop(), () => wakeLock?.release().catch(() => {})]) {
       try {
-        step();
+        fn();
       } catch {}
     }
-    rec = null;
     onClose();
   });
 
-  // Que el tutor salude al empezar la llamada.
-  if (chat.messages[chat.messages.length - 1].role === 'assistant') {
-    chat.messages.push({ role: 'user', content: AI.CALL_KICKOFF, hidden: true });
-  }
+  // Que el tutor salude al empezar la llamada (o conteste lo que quedara pendiente).
+  if (!unanswered()) chat.messages.push({ role: 'user', content: AI.CALL_KICKOFF, hidden: true });
   tutorTurn();
 }
 
@@ -1194,12 +1297,13 @@ function renderSettings() {
         e.preventDefault();
         const l = b.dataset.eltest;
         if (!el.voices[l]) return toast('Primero elige una voz.');
-        stopAllVoices();
-        tutorVoice.unlock();
-        tutorVoice.talk(SAMPLE[l], {
-          config: { voiceId: el.voices[l], lang: l },
+        speaker.unlock();
+        const talk = speaker.begin(l, {
+          override: { key: el.key, model: el.model, voiceId: el.voices[l] },
           onError: (err) => toast(err.message),
-        }).then(showUsage);
+        });
+        talk.push(SAMPLE[l]);
+        talk.finish().then(showUsage);
       }),
     );
   };
