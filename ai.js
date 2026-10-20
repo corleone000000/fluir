@@ -13,11 +13,28 @@ export const FIX_MARK = '%%';
 
 const LANG_NAMES = { en: 'English', es: 'Spanish' };
 
+// Quita espacios, saltos de línea y caracteres invisibles que se cuelan al copiar y pegar.
+export const cleanKey = (key = '') => key.replace(/[^\x21-\x7E]/g, '');
+
+// Avisa si lo pegado no tiene pinta de clave de Claude.
+export function keyProblem(key) {
+  if (!key) return '';
+  if (key.startsWith('sk_')) return 'Esta parece la clave de ElevenLabs. La de Claude empieza por «sk-ant-».';
+  if (!key.startsWith('sk-ant-')) return 'Las claves de Claude empiezan por «sk-ant-». Revisa que la has copiado entera.';
+  if (key.length < 60) return 'La clave parece incompleta. Cópiala otra vez entera.';
+  return '';
+}
+
 function client() {
-  const apiKey = state.settings.apiKey.trim();
+  const apiKey = cleanKey(state.settings.apiKey);
   if (!apiKey) throw new Error('NO_KEY');
   // La clave vive solo en este móvil; la app no tiene servidor propio.
   return new Anthropic({ apiKey, dangerouslyAllowBrowser: true });
+}
+
+// Comprueba la clave sin gastar nada (listar modelos es gratis).
+export async function checkKey() {
+  await client().models.list({ limit: 1 });
 }
 
 function baseParams() {

@@ -982,7 +982,14 @@ function renderSettings() {
     <div class="card">
       <h3>🤖 Tutor con IA</h3>
       <p class="muted" style="margin-top:0">Necesita una clave de la API de Anthropic. Se crea en <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a> y se paga por uso. La clave se guarda solo en este móvil.</p>
-      <label class="field"><span>Clave de la API</span><input class="input" id="key" type="password" placeholder="sk-ant-…" value="${esc(s.apiKey)}" autocomplete="off"></label>
+      <label class="field"><span>Clave de la API</span>
+        <div class="row">
+          <input class="input grow" id="key" type="password" placeholder="sk-ant-…" value="${esc(s.apiKey)}" autocomplete="off" autocapitalize="off" spellcheck="false">
+          <button class="speak" id="key-eye" aria-label="Mostrar u ocultar la clave">👁️</button>
+        </div>
+      </label>
+      <p class="muted" id="key-hint" style="color:var(--bad);margin-top:-6px" hidden></p>
+      <button class="btn secondary block" id="key-test" style="margin-bottom:14px">Probar clave</button>
       <label class="field"><span>Modelo</span>
         <select class="input" id="model">
           ${AI.MODELS.map((m) => `<option value="${m.id}" ${m.id === s.model ? 'selected' : ''}>${m.name} — ${m.note}</option>`).join('')}
@@ -1049,7 +1056,41 @@ function renderSettings() {
   `);
   const bind = (id, ev, fn) => document.getElementById(id).addEventListener(ev, fn);
   bind('name', 'change', (e) => { s.name = e.target.value.trim(); save(); });
-  bind('key', 'change', (e) => { s.apiKey = e.target.value.trim(); save(); toast('Clave guardada'); });
+  const showKeyHint = () => {
+    const problem = AI.keyProblem(s.apiKey);
+    const $h = document.getElementById('key-hint');
+    $h.textContent = problem ? `⚠️ ${problem}` : '';
+    $h.hidden = !problem;
+  };
+  bind('key', 'input', (e) => {
+    s.apiKey = AI.cleanKey(e.target.value);
+    save();
+    showKeyHint();
+  });
+  bind('key', 'change', (e) => {
+    e.target.value = s.apiKey;
+    toast('Clave guardada');
+  });
+  bind('key-eye', 'click', (e) => {
+    e.preventDefault();
+    const $k = document.getElementById('key');
+    $k.type = $k.type === 'password' ? 'text' : 'password';
+  });
+  bind('key-test', 'click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Comprobando…';
+    try {
+      await AI.checkKey();
+      toast('✅ La clave de Claude funciona');
+    } catch (err) {
+      toast(`❌ ${AI.friendlyError(err)}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Probar clave';
+    }
+  });
+  showKeyHint();
   bind('model', 'change', (e) => { s.model = e.target.value; save(); });
   bind('goal', 'change', (e) => { s.dailyGoal = Number(e.target.value); save(); });
   bind('newpd', 'change', (e) => { s.newPerDay = Number(e.target.value); save(); });
@@ -1158,7 +1199,9 @@ function renderSettings() {
     save();
   });
   bind('el-key', 'change', (e) => {
-    el.key = e.target.value.trim();
+    el.key = AI.cleanKey(e.target.value);
+    e.target.value = el.key;
+    if (el.key.startsWith('sk-ant-')) toast('⚠️ Esa es la clave de Claude, no la de ElevenLabs.');
     el.voiceList = [];
     save();
     drawElevenVoices();

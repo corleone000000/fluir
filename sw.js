@@ -1,6 +1,6 @@
 // Guarda la app en el móvil para que abra rápido y funcione sin conexión
 // (el tutor con IA sí necesita internet).
-const CACHE = 'fluir-v4';
+const CACHE = 'fluir-v5';
 const ASSETS = [
   './',
   'index.html',

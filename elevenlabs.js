@@ -21,7 +21,8 @@ async function request(path, key, options = {}) {
   try {
     res = await fetch(`${API}${path}`, {
       ...options,
-      headers: { 'xi-api-key': key, ...(options.body ? { 'Content-Type': 'application/json' } : {}) },
+      // Sin espacios ni caracteres invisibles que se cuelan al copiar y pegar.
+      headers: { 'xi-api-key': key.replace(/[^\x21-\x7E]/g, ''), ...(options.body ? { 'Content-Type': 'application/json' } : {}) },
     });
   } catch (err) {
     if (err.name === 'AbortError') throw err;
