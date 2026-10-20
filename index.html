@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Fluir</title>
+  <meta name="description" content="Practica inglés y español: tutor con IA, tarjetas y ejercicios.">
+  <meta name="theme-color" content="#5b4cdb">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Fluir">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <button class="icon-btn" id="back-btn" aria-label="Volver" hidden>←</button>
+      <h1 id="screen-title">Fluir</h1>
+      <div class="lang-switch" role="group" aria-label="Idioma que practicas">
+        <button data-lang="en" class="lang-btn">🇬🇧 EN</button>
+        <button data-lang="es" class="lang-btn">🇪🇸 ES</button>
+      </div>
+    </header>
+    <main id="screen"></main>
+    <nav class="tabbar">
+      <button data-go="home" class="tab"><span>🏠</span>Inicio</button>
+      <button data-go="tutor" class="tab"><span>💬</span>Tutor</button>
+      <button data-go="cards" class="tab"><span>🃏</span>Tarjetas</button>
+      <button data-go="practice" class="tab"><span>✍️</span>Ejercicios</button>
+      <button data-go="progress" class="tab"><span>📈</span>Progreso</button>
+    </nav>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
