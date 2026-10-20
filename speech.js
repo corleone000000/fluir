@@ -89,20 +89,42 @@ export function stopSpeaking() {
 const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 export const canListen = Boolean(Recognition);
 
-// Escucha una frase. onText recibe el texto parcial y final; onEnd se llama al terminar.
+// Escucha una frase. onText recibe el texto parcial y final; onEnd se llama una sola vez al terminar.
+// Devuelve { stop, abort }: stop termina y conserva lo dicho, abort lo descarta.
 export function listen(langCode, { onText, onEnd, onError }) {
   if (!canListen) return null;
   const rec = new Recognition();
   rec.lang = langCode;
   rec.interimResults = true;
   rec.continuous = false;
+  let ended = false;
+  let guard = null;
+  const finish = () => {
+    if (ended) return;
+    ended = true;
+    clearTimeout(guard);
+    onEnd?.();
+  };
   rec.onresult = (e) => {
+    if (ended) return;
     let text = '';
     for (const r of e.results) text += r[0].transcript;
     onText(text, e.results[e.results.length - 1].isFinal);
   };
   rec.onerror = (e) => onError?.(e.error);
-  rec.onend = () => onEnd?.();
-  rec.start();
-  return rec;
+  rec.onend = finish;
+  // En iPhone a veces no llega el aviso de fin: si tarda, lo damos por terminado nosotros.
+  const end = (method) => {
+    try {
+      rec[method]();
+    } catch {}
+    if (!guard) guard = setTimeout(finish, 1200);
+  };
+  try {
+    rec.start();
+  } catch {
+    onError?.('start-failed');
+    setTimeout(finish);
+  }
+  return { stop: () => end('stop'), abort: () => end('abort') };
 }

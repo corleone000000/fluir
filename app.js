@@ -484,21 +484,35 @@ function openCall({ chat, scenario, lang, onClose }) {
     }
   }
 
+  // Tiempos del turno de escucha: silencio tras hablar = ha terminado; nada al empezar = no hay nadie.
+  const PAUSE_MS = 2000;
+  const NO_SPEECH_MS = 8000;
+  let userStopped = false;
+  let listenTimer = null;
+
   function startListening() {
     if (closed || rec) return;
     stopAllVoices();
     let heard = '';
-    setPhase('listening', 'Te escucho…');
+    userStopped = false;
+    setPhase('listening', 'Te escucho… (toca el círculo para pausar)');
     $('call-you').textContent = '';
+    const restartTimer = (ms) => {
+      clearTimeout(listenTimer);
+      listenTimer = setTimeout(() => rec?.stop(), ms);
+    };
     rec = listen(L.voice, {
       onText: (t) => {
         heard = t;
         $('call-you').textContent = `«${t}»`;
+        // Algunos móviles no cortan solos al quedarse en silencio: lo hacemos nosotros.
+        restartTimer(PAUSE_MS);
       },
       onError: (code) => {
         if (code === 'not-allowed' || code === 'service-not-allowed') micDenied = true;
       },
       onEnd: () => {
+        clearTimeout(listenTimer);
         rec = null;
         if (closed) return;
         if (heard.trim()) {
@@ -506,14 +520,18 @@ function openCall({ chat, scenario, lang, onClose }) {
           userTurn(heard.trim());
         } else if (micDenied) {
           setPhase('idle', 'Permite el micrófono en el navegador para poder hablar.');
+        } else if (userStopped) {
+          setPhase('idle', 'En pausa. Toca el círculo cuando quieras hablar.');
         } else if (++silentTries < 3) {
           startListening();
         } else {
-          setPhase('idle', 'Toca el círculo cuando quieras hablar');
+          const ios = navigator.standalone === true;
+          setPhase('idle', `No te oigo. Toca el círculo para hablar.${ios ? ' Si sigue sin oírte, abre la app desde Safari.' : ''}`);
         }
       },
     });
     if (!rec) setPhase('idle', 'Este navegador no permite usar el micrófono.');
+    else restartTimer(NO_SPEECH_MS);
   }
 
   $('orb').addEventListener('click', () => {
@@ -522,9 +540,11 @@ function openCall({ chat, scenario, lang, onClose }) {
       // Corta al tutor; en cuanto termina su turno se pone a escuchar solo.
       interrupted = true;
       stopAllVoices();
-    }
-    else if (phase === 'listening') rec?.stop(); // envía lo que haya dicho ya
-    else if (phase === 'idle') {
+    } else if (phase === 'listening') {
+      // Si ya ha dicho algo, lo envía; si no, deja la llamada en pausa.
+      userStopped = true;
+      rec?.stop();
+    } else if (phase === 'idle') {
       silentTries = 0;
       startListening();
     }
@@ -542,13 +562,19 @@ function openCall({ chat, scenario, lang, onClose }) {
     toast(slow ? 'El tutor hablará más despacio' : 'Velocidad normal');
   });
 
+  // Colgar siempre cierra la pantalla, aunque el micrófono o el audio den problemas.
   $('btn-hang').addEventListener('click', () => {
+    if (closed) return;
     closed = true;
-    rec?.abort();
-    stopAllVoices();
-    clearInterval(timer);
-    wakeLock?.release().catch(() => {});
     overlay.remove();
+    clearInterval(timer);
+    clearTimeout(listenTimer);
+    for (const step of [() => rec?.abort(), stopAllVoices, () => wakeLock?.release().catch(() => {})]) {
+      try {
+        step();
+      } catch {}
+    }
+    rec = null;
     onClose();
   });
 
