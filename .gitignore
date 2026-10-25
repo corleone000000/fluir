@@ -1,0 +1,3 @@
+# Cosas de este ordenador que no forman parte de la app publicada
+.vscode/
+*.lnk
