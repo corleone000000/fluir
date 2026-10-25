@@ -126,8 +126,8 @@ const SPEED_TOOL = {
 };
 
 // Tiempos máximos: si la respuesta no empieza o se queda parada, se corta y se reintenta.
-const FIRST_TOKEN_MS = 15000;
-const STALL_MS = 12000;
+const FIRST_TOKEN_MS = 10000;
+const STALL_MS = 8000;
 const MAX_TOOL_ROUNDS = 3;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -160,6 +160,12 @@ function withoutThinking(content) {
   );
 }
 
+// En charlas largas solo se envía lo reciente: menos que leer = respuestas más rápidas.
+// La ventana avanza a saltos (no en cada mensaje) para no estropear la parte ya procesada,
+// y siempre empieza por algo que dijo ella (nunca a mitad de un cambio de velocidad).
+const HISTORY_KEEP = 30;
+const HISTORY_STEP = 20;
+
 function historyForApi(messages) {
   const out = [];
   for (const { role, content } of messages) {
@@ -167,7 +173,10 @@ function historyForApi(messages) {
     const clean = withoutThinking(content);
     if (typeof clean === 'string' ? clean.trim() : clean.length) out.push({ role, content: clean });
   }
-  return out;
+  if (out.length <= HISTORY_KEEP + HISTORY_STEP) return out;
+  let start = Math.floor((out.length - HISTORY_KEEP) / HISTORY_STEP) * HISTORY_STEP;
+  while (start < out.length - 1 && !(out[start].role === 'user' && typeof out[start].content === 'string')) start++;
+  return out.slice(start);
 }
 
 async function streamRound(params, { signal, onDelta }) {

@@ -235,6 +235,7 @@ textarea.input { resize: vertical; min-height: 44px; }
   background: var(--surface-2); font-size: 1.2rem;
 }
 .mic.on { background: var(--bad); color: #fff; animation: pulse 1.2s infinite; }
+.mic.on[style*="--level"] { animation: none; transform: scale(calc(1 + var(--level, 0) * .3)); transition: transform .08s linear; }
 @keyframes pulse { 50% { transform: scale(1.08); } }
 .send { width: 46px; height: 46px; padding: 0; border-radius: 50%; flex: none; }
 .scenarios { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -267,7 +268,13 @@ textarea.input { resize: vertical; min-height: 44px; }
   position: absolute; inset: -14px; border-radius: 50%;
   border: 3px solid rgba(179, 170, 255, .5); opacity: 0;
 }
-.call[data-phase="listening"] .orb { background: radial-gradient(circle at 35% 30%, #9ff0c6, #1f9d63 60%, #146b43); box-shadow: 0 0 60px rgba(60, 207, 138, .4); }
+.call[data-phase="listening"] .orb {
+  background: radial-gradient(circle at 35% 30%, #9ff0c6, #1f9d63 60%, #146b43);
+  box-shadow: 0 0 60px rgba(60, 207, 138, .4);
+  /* Crece con su voz: así ve que el micrófono la está oyendo */
+  transform: scale(calc(1 + var(--level, 0) * .22));
+  transition: transform .08s linear, background .3s;
+}
 .call[data-phase="listening"] .orb span { border-color: rgba(60, 207, 138, .6); animation: ring 1.6s ease-out infinite; }
 .call[data-phase="speaking"] .orb { animation: talk .9s ease-in-out infinite; }
 .call[data-phase="thinking"] .orb { animation: think 1.4s ease-in-out infinite; }

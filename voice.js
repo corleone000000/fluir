@@ -4,7 +4,7 @@
 import { speakQueued, stopSpeaking, audioMode, unlockSpeech } from './speech.js';
 import { synthesize, silentWav } from './elevenlabs.js';
 
-const FETCH_TIMEOUT_MS = 12000;
+const FETCH_TIMEOUT_MS = 7000;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 

@@ -5,6 +5,7 @@ import { speak, canSpeak, canListen, listen, voicesFor, isGoodVoice, onVoicesCha
 import * as AI from './ai.js';
 import * as EL from './elevenlabs.js';
 import { createSpeaker, sentences } from './voice.js';
+import { canRecord, record, unlockMic } from './hearing.js';
 
 const $screen = document.getElementById('screen');
 const $title = document.getElementById('screen-title');
@@ -53,6 +54,25 @@ const speaker = createSpeaker({
   },
 });
 const stopAllVoices = () => speaker.stop();
+
+// Para entender lo que dice: si hay ElevenLabs, la app graba su voz y ElevenLabs la transcribe
+// (entiende mucho mejor a quien está aprendiendo). Si no se puede, se usa el dictado del móvil.
+let cloudEarsOff = false;
+const cloudEars = () => {
+  const e = state.settings.eleven;
+  return canRecord && !cloudEarsOff && e.enabled && Boolean(e.key) && e.stt !== false;
+};
+// Pasa al dictado del móvil el resto de la sesión, explicando por qué.
+function earsFallback(reason) {
+  if (cloudEarsOff) return;
+  cloudEarsOff = true;
+  toast(
+    reason === 'permission'
+      ? 'Tu clave de ElevenLabs no tiene permiso de «Speech to Text». De momento uso el dictado del móvil.'
+      : 'No puedo usar el micrófono así en este móvil. Uso el dictado del móvil.',
+  );
+}
+const transcribe = (pcm, lang) => EL.transcribe(pcm, { key: state.settings.eleven.key, lang });
 
 // Lee en voz alta una respuesta ya completa del tutor.
 function tutorSay(text, slow = false) {
@@ -355,14 +375,45 @@ function renderChat(chat) {
   });
 
   const $mic = document.getElementById('mic');
-  $mic?.addEventListener('click', () => {
+  $mic?.addEventListener('click', async () => {
     if (rec) {
       rec.stop();
       return;
     }
     stopAllVoices();
+    speaker.unlock();
+    unlockMic();
     const before = $msg.value ? `${$msg.value.trim()} ` : '';
     $mic.classList.add('on');
+    if (cloudEars()) {
+      // Graba hasta que se calla (o vuelve a tocar el micro) y ElevenLabs lo pasa a texto.
+      const placeholder = $msg.placeholder;
+      $msg.placeholder = 'Te escucho…';
+      const take = record({ endSilenceMs: 1600, maxWaitMs: 12000, onLevel: (v) => $mic.style.setProperty('--level', v.toFixed(2)) });
+      rec = { stop: () => take.stop() };
+      const { pcm, reason } = await take.result;
+      rec = null;
+      $mic.style.setProperty('--level', '0');
+      try {
+        if (pcm) {
+          $msg.placeholder = 'Entendiendo…';
+          const text = await transcribe(pcm, lang);
+          if (text) $msg.value = before + text;
+          else toast('No te he oído bien. Prueba otra vez.');
+        } else if (reason === 'denied') {
+          toast('Permite el micrófono en el navegador para hablar.');
+        } else if (reason === 'no-audio' || reason === 'error') {
+          earsFallback('device');
+        }
+      } catch (err) {
+        if ([401, 403].includes(err?.status)) earsFallback('permission');
+        else toast(err?.message || 'No he podido entenderte.');
+      } finally {
+        $msg.placeholder = placeholder;
+        $mic.classList.remove('on');
+      }
+      return;
+    }
     rec = listen(voice(), {
       onText: (t) => {
         $msg.value = before + t;
@@ -396,6 +447,8 @@ function renderChat(chat) {
     rec?.stop();
     stopAllVoices();
     speaker.unlock();
+    unlockMic();
+    if (state.settings.model !== 'claude-haiku-5-5') toast('💡 Para que el tutor conteste más rápido, elige «Claude Haiku 5.5» en Ajustes.');
     openCall({ chat, scenario, lang, onClose: () => go('tutor') });
   });
 
@@ -437,7 +490,8 @@ function openCall({ chat, scenario, lang, onClose }) {
   const PAUSE_MS = 2000;
   const NO_SPEECH_MS = 8000;
   const MAX_SILENT_TRIES = 4;
-  const AFTER_SPEECH_MS = 300; // para que el micro no oiga el final de la voz del tutor
+  const AFTER_SPEECH_MS = 200; // para que el micro no oiga el final de la voz del tutor
+  const END_SILENCE_MS = 1300; // con ElevenLabs: este silencio tras hablar = ha terminado
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   // Cada fase nueva (pensar, hablar, escuchar, pausa) sube `step`, y lo que llegue tarde de una
@@ -581,6 +635,7 @@ function openCall({ chat, scenario, lang, onClose }) {
     userStopped = false;
     setPhase('listening', 'Te escucho… (toca el círculo para pausar)');
     $('call-you').textContent = '';
+    if (cloudEars()) return listenCloud(my);
     const arm = (ms) => {
       clearTimeout(listenTimer);
       listenTimer = setTimeout(() => {
@@ -622,8 +677,52 @@ function openCall({ chat, scenario, lang, onClose }) {
     arm(NO_SPEECH_MS);
   }
 
+  // Escucha con ElevenLabs: la app nota cuándo habla y cuándo calla (el círculo se mueve con su voz)
+  // y después ElevenLabs pasa a texto lo que ha dicho.
+  async function listenCloud(my) {
+    const orb = $('orb');
+    const take = record({
+      endSilenceMs: END_SILENCE_MS,
+      maxWaitMs: 15000,
+      onLevel: (v) => my === step && orb.style.setProperty('--level', v.toFixed(2)),
+      onSpeech: () => my === step && setPhase('listening', 'Te escucho… (toca el círculo para enviar ya)'),
+    });
+    rec = { stop: () => take.stop(), abort: () => take.cancel() };
+    const { pcm, reason } = await take.result;
+    orb.style.setProperty('--level', '0');
+    if (my !== step || closed) return;
+    rec = null;
+    if (reason === 'no-audio' || reason === 'error') {
+      earsFallback('device');
+      return startListening();
+    }
+    if (reason === 'denied') return setPhase('idle', 'Permite el micrófono en el navegador y toca el círculo para hablar.');
+    if (!pcm) {
+      if (userStopped) return setPhase('idle', 'En pausa. Toca el círculo cuando quieras hablar.');
+      if (++silentTries < MAX_SILENT_TRIES) return startListening();
+      return setPhase('idle', 'No te oigo. Toca el círculo para hablar.');
+    }
+    setPhase('thinking', 'Entendiendo…');
+    try {
+      const text = await transcribe(pcm, lang);
+      if (my !== step || closed) return;
+      if (!text) return startListening(); // era ruido: seguimos escuchando
+      silentTries = 0;
+      $('call-you').textContent = `«${text}»`;
+      userTurn(text);
+    } catch (err) {
+      if (my !== step || closed) return;
+      if ([401, 403].includes(err?.status)) {
+        earsFallback('permission');
+        return setPhase('idle', 'No he podido entenderte. Toca el círculo y repítelo, por favor.');
+      }
+      setPhase('idle', `${err?.message || 'No he podido entenderte.'} Toca el círculo y repítelo, por favor.`);
+    }
+  }
+
   $('orb').addEventListener('click', () => {
     speaker.unlock();
+    unlockMic();
     const phase = overlay.dataset.phase;
     if (phase === 'speaking') {
       // Corta al tutor y le toca a ella.
@@ -1150,12 +1249,13 @@ function renderSettings() {
             ${EL.EL_MODELS.map((m) => `<option value="${m.id}" ${m.id === s.eleven.model ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
           </select>
         </label>
+        <label class="row field"><input type="checkbox" id="el-stt" ${s.eleven.stt !== false ? 'checked' : ''}> <span style="margin:0"><b>Entender tu voz con ElevenLabs</b> — mucho más preciso que el dictado del móvil (necesita el permiso <b>Speech to Text</b> en la clave)</span></label>
         <button class="btn secondary block" id="el-load">Cargar mis voces</button>
         <div id="el-voices" style="margin-top:14px"></div>
         <p class="muted" id="el-usage" style="margin-bottom:0"></p>
         <details style="margin-top:10px">
           <summary class="muted" style="cursor:pointer">¿Dónde consigo la clave?</summary>
-          <p class="muted">En elevenlabs.io → abajo a la izquierda, tu perfil → <b>API Keys</b> → <b>Create API Key</b>. Dale permiso a <b>Text to Speech</b>, <b>Voices (leer)</b> y <b>User (leer)</b>. Si quieres, ponle un límite de créditos.</p>
+          <p class="muted">En elevenlabs.io → abajo a la izquierda, tu perfil → <b>API Keys</b> → <b>Create API Key</b>. Dale permiso a <b>Text to Speech</b>, <b>Speech to Text</b>, <b>Voices (leer)</b> y <b>User (leer)</b>. Si ya tienes una clave, puedes editarla y añadirle el permiso que falte. Si quieres, ponle un límite de créditos.</p>
           <p class="muted" style="margin-bottom:0">Para tener más voces, añádelas desde la <b>Voice Library</b> de ElevenLabs y pulsa otra vez «Cargar mis voces».</p>
         </details>
       </div>
@@ -1334,9 +1434,15 @@ function renderSettings() {
     e.target.value = el.key;
     if (el.key.startsWith('sk-ant-')) toast('⚠️ Esa es la clave de Claude, no la de ElevenLabs.');
     el.voiceList = [];
+    cloudEarsOff = false;
     save();
     drawElevenVoices();
     if (el.key) document.getElementById('el-load').click();
+  });
+  bind('el-stt', 'change', (e) => {
+    el.stt = e.target.checked;
+    cloudEarsOff = false; // volver a intentarlo (por ejemplo, tras añadir el permiso a la clave)
+    save();
   });
   bind('el-model', 'change', (e) => {
     el.model = e.target.value;

@@ -13,7 +13,7 @@ const DEFAULT_STATE = {
     model: 'claude-opus-5-5',
     dailyGoal: 50,
     newPerDay: 10,
-    rate: 0.95,
+    rate: 1,
     autoSpeak: true,
     voices: { en: '', es: '' }, // voz elegida por idioma ('' = la mejor automáticamente)
     eleven: {
@@ -22,6 +22,7 @@ const DEFAULT_STATE = {
       model: 'eleven_v4_turbo',
       voices: { en: '', es: '' },
       voiceList: [],
+      stt: true, // entender su voz con ElevenLabs (mucho más preciso que el dictado del móvil)
     },
   },
   xpByDay: {},
@@ -43,6 +44,8 @@ function load() {
     const raw = localStorage.getItem(KEY);
     if (!raw) return structuredClone(DEFAULT_STATE);
     const saved = JSON.parse(raw);
+    // La velocidad por defecto antes era 0,95 (sonaba algo lenta); si nadie la cambió, pasa a 1.
+    if (saved.settings?.rate === 0.95) saved.settings.rate = 1;
     return {
       ...structuredClone(DEFAULT_STATE),
       ...saved,
